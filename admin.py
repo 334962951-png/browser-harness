@@ -5,6 +5,12 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Import cross-platform socket compatibility layer
+from socket_compat import (
+    IS_WINDOWS, get_socket_path, get_temp_dir,
+    create_socket, connect_socket, bind_socket, cleanup_socket
+)
+
 
 def _load_env():
     p = Path(__file__).parent / ".env"
@@ -23,31 +29,37 @@ _load_env()
 NAME = os.environ.get("BU_NAME", "default")
 BU_API = "https://api.browser-use.com/api/v3"
 GH_RELEASES = "https://api.github.com/repos/browser-use/browser-harness/releases/latest"
-VERSION_CACHE = Path("/tmp/bu-version-cache.json")
+temp_dir = get_temp_dir()
+VERSION_CACHE = temp_dir / "bu-version-cache.json"
 VERSION_CACHE_TTL = 24 * 3600
 
 
 def _paths(name):
     n = name or NAME
-    return f"/tmp/bu-{n}.sock", f"/tmp/bu-{n}.pid"
+    temp = get_temp_dir()
+    sock_path = get_socket_path(n)
+    pid_path = temp / f"bu-{n}.pid"
+    log_path = temp / f"bu-{n}.log"
+    return sock_path, str(pid_path), str(log_path)
 
 
 def _log_tail(name):
-    p = f"/tmp/bu-{name or NAME}.log"
+    _, _, log_path = _paths(name)
     try:
-        return Path(p).read_text().strip().splitlines()[-1]
+        return Path(log_path).read_text().strip().splitlines()[-1]
     except (FileNotFoundError, IndexError):
         return None
 
 
 def daemon_alive(name=None):
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s = create_socket()
         s.settimeout(1)
-        s.connect(_paths(name)[0])
+        sock_path, _, _ = _paths(name)
+        connect_socket(s, sock_path)
         s.close()
         return True
-    except (FileNotFoundError, ConnectionRefusedError, socket.timeout):
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
         return False
 
 
@@ -57,8 +69,10 @@ def ensure_daemon(wait=60.0, name=None, env=None):
         # Stale daemons accept connects AND reply to meta:* (pure Python) even when the
         # CDP WS to Chrome is dead — probe with a real CDP call and require "result".
         try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(3)
-            s.connect(_paths(name)[0])
+            s = create_socket()
+            s.settimeout(3)
+            sock_path, _, _ = _paths(name)
+            connect_socket(s, sock_path)
             s.sendall(b'{"method":"Target.getTargets","params":{}}\n')
             data = b""
             while not data.endswith(b"\n"):
@@ -89,7 +103,8 @@ def ensure_daemon(wait=60.0, name=None, env=None):
             print("browser-harness: click Allow on chrome://inspect (and tick the checkbox if shown)", file=sys.stderr)
             restart_daemon(name)
             continue
-        raise RuntimeError(msg or f"daemon {name or NAME} didn't come up -- check /tmp/bu-{name or NAME}.log")
+        _, _, log_path = _paths(name)
+        raise RuntimeError(msg or f"daemon {name or NAME} didn't come up -- check {log_path}")
 
 
 def stop_remote_daemon(name="remote"):
@@ -114,11 +129,11 @@ def restart_daemon(name=None):
     ensure_daemon(). The function itself only stops."""
     import signal
 
-    sock, pid_path = _paths(name)
+    sock, pid_path, _ = _paths(name)
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s = create_socket()
         s.settimeout(5)
-        s.connect(sock)
+        connect_socket(s, sock)
         s.sendall(b'{"meta":"shutdown"}\n')
         s.recv(1024)
         s.close()
@@ -140,11 +155,13 @@ def restart_daemon(name=None):
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-    for f in (sock, pid_path):
+    for f in (pid_path,):
         try:
             os.unlink(f)
         except FileNotFoundError:
             pass
+    # Clean up socket file (Unix only)
+    cleanup_socket(sock)
 
 
 def _browser_use(path, method, body=None):

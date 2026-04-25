@@ -5,6 +5,12 @@ from pathlib import Path
 
 from cdp_use.client import CDPClient
 
+# Import cross-platform socket compatibility layer
+from socket_compat import (
+    IS_WINDOWS, get_socket_path, get_temp_dir,
+    create_socket, bind_socket, cleanup_socket
+)
+
 
 def _load_env():
     p = Path(__file__).parent / ".env"
@@ -21,9 +27,10 @@ def _load_env():
 _load_env()
 
 NAME = os.environ.get("BU_NAME", "default")
-SOCK = f"/tmp/bu-{NAME}.sock"
-LOG = f"/tmp/bu-{NAME}.log"
-PID = f"/tmp/bu-{NAME}.pid"
+SOCK = get_socket_path(NAME)
+temp_dir = get_temp_dir()
+LOG = str(temp_dir / f"bu-{NAME}.log")
+PID = str(temp_dir / f"bu-{NAME}.pid")
 BUF = 500
 PROFILES = [
     Path.home() / "Library/Application Support/Google/Chrome",
@@ -192,8 +199,8 @@ class Daemon:
 
 
 async def serve(d):
-    if os.path.exists(SOCK):
-        os.unlink(SOCK)
+    # Clean up socket file (Unix only)
+    cleanup_socket(SOCK)
 
     async def handler(reader, writer):
         try:
@@ -212,9 +219,17 @@ async def serve(d):
         finally:
             writer.close()
 
-    server = await asyncio.start_unix_server(handler, path=SOCK)
-    os.chmod(SOCK, 0o600)
-    log(f"listening on {SOCK} (name={NAME}, remote={REMOTE_ID or 'local'})")
+    if IS_WINDOWS:
+        # Windows: use TCP server
+        host, port = SOCK
+        server = await asyncio.start_server(handler, host, port)
+        log(f"listening on {host}:{port} (name={NAME}, remote={REMOTE_ID or 'local'})")
+    else:
+        # Unix: use Unix domain socket server
+        server = await asyncio.start_unix_server(handler, path=SOCK)
+        os.chmod(SOCK, 0o600)
+        log(f"listening on {SOCK} (name={NAME}, remote={REMOTE_ID or 'local'})")
+
     async with server:
         await d.stop.wait()
 
@@ -227,9 +242,12 @@ async def main():
 
 def already_running():
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(1)
-        s.connect(SOCK); s.close(); return True
-    except (FileNotFoundError, ConnectionRefusedError, socket.timeout):
+        s = create_socket()
+        s.settimeout(1)
+        s.connect(SOCK)
+        s.close()
+        return True
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
         return False
 
 

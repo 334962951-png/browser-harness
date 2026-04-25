@@ -3,6 +3,12 @@ import base64, json, os, socket, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+# Import cross-platform socket compatibility layer
+from socket_compat import (
+    IS_WINDOWS, get_socket_path, get_temp_dir,
+    create_socket, connect_socket
+)
+
 
 def _load_env():
     p = Path(__file__).parent / ".env"
@@ -19,13 +25,13 @@ def _load_env():
 _load_env()
 
 NAME = os.environ.get("BU_NAME", "default")
-SOCK = f"/tmp/bu-{NAME}.sock"
+SOCK = get_socket_path(NAME)
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 
 
 def _send(req):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(SOCK)
+    s = create_socket()
+    connect_socket(s, SOCK)
     s.sendall((json.dumps(req) + "\n").encode())
     data = b""
     while not data.endswith(b"\n"):
@@ -75,7 +81,8 @@ def click_at_xy(x, y, button="left", clicks=1):
         try:
             from PIL import Image, ImageDraw
             dpr = js("window.devicePixelRatio") or 1
-            path = capture_screenshot(f"/tmp/debug_click_{_debug_click_counter}.png")
+            temp_dir = get_temp_dir()
+            path = capture_screenshot(str(temp_dir / f"debug_click_{_debug_click_counter}.png"))
             img = Image.open(path)
             draw = ImageDraw.Draw(img)
             px, py = int(x * dpr), int(y * dpr)
@@ -118,9 +125,13 @@ def scroll(x, y, dy=-300, dx=0):
 
 
 # --- visual ---
-def capture_screenshot(path="/tmp/shot.png", full=False):
+def capture_screenshot(path=None, full=False):
+    if path is None:
+        temp_dir = get_temp_dir()
+        path = str(temp_dir / "shot.png")
     r = cdp("Page.captureScreenshot", format="png", captureBeyondViewport=full)
     open(path, "wb").write(base64.b64decode(r["data"]))
+    return path
     return path
 
 
